@@ -1,13 +1,11 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections import defaultdict
 import copy
 import json
 import os
 from os.path import exists, join, isdir
 from dataclasses import dataclass, field
-import sys
 from typing import Optional, Dict, Sequence
 import numpy as np
 from tqdm import tqdm
@@ -19,22 +17,23 @@ import transformers
 from torch.nn.utils.rnn import pad_sequence
 import argparse
 from transformers import (
-    AutoTokenizer, 
-    AutoModelForCausalLM, 
-    set_seed, 
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    set_seed,
     Seq2SeqTrainer,
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
 )
 from datasets import load_dataset
 import evaluate
-import nltk
+
+# import nltk
 
 from peft import (
-    prepare_model_for_int8_training,
+    prepare_model_for_kbit_training,
     LoraConfig,
     get_peft_model,
     get_peft_model_state_dict,
-    PeftModel
+    PeftModel,
 )
 from peft.tuners.lora import LoraLayer
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
@@ -47,15 +46,19 @@ logger = logging.getLogger(__name__)
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
 
+
 @dataclass
 class ModelArguments:
-    model_name_or_path: Optional[str] = field(
-        default="EleutherAI/pythia-12b"
-    )
+    # TODO: XT - name or path to an LM model
+    model_name_or_path: Optional[str] = field(default="EleutherAI/pythia-12b")
+    # TODO: XT - some model apparently has code that needs to be run on the server
     trust_remote_code: Optional[bool] = field(
         default=False,
-        metadata={"help": "Enable unpickling of arbitrary code in AutoModelForCausalLM#from_pretrained."}
+        metadata={
+            "help": "Enable unpickling of arbitrary code in AutoModelForCausalLM#from_pretrained."
+        },
     )
+
 
 @dataclass
 class DataArguments:
@@ -78,105 +81,165 @@ class DataArguments:
     )
     source_max_len: int = field(
         default=1024,
-        metadata={"help": "Maximum source sequence length. Sequences will be right padded (and possibly truncated)."},
+        metadata={
+            "help": "Maximum source sequence length. Sequences will be right padded (and possibly truncated)."
+        },
     )
     target_max_len: int = field(
         default=256,
-        metadata={"help": "Maximum target sequence length. Sequences will be right padded (and possibly truncated)."},
+        metadata={
+            "help": "Maximum target sequence length. Sequences will be right padded (and possibly truncated)."
+        },
     )
+    # TODO: XT - Need to look into how to set it to our in-house dataset for fine-tuning
     dataset: str = field(
-        default='alpaca',
-        metadata={"help": "Which dataset to finetune on. See datamodule for options."}
+        default="alpaca",
+        metadata={"help": "Which dataset to finetune on. See datamodule for options."},
     )
+
 
 @dataclass
 class TrainingArguments(transformers.Seq2SeqTrainingArguments):
-    cache_dir: Optional[str] = field(
-        default=None
-    )
+    cache_dir: Optional[str] = field(default=None)
+    # https://github.com/lppllppl920/qlora/blob/9f684a4c8c50422ed58867e051ff98aaf49ba98e/qlora.py#L495
     train_on_source: Optional[bool] = field(
         default=False,
-        metadata={"help": "Whether to train on the input in addition to the target text."}
+        metadata={
+            "help": "Whether to train on the input in addition to the target text."
+        },
     )
+    # TODO: XT - MMLU seems to be a benchmark used for model evaluation
     mmlu_split: Optional[str] = field(
-        default='eval',
-        metadata={"help": "The MMLU split to run on"}
+        default="eval", metadata={"help": "The MMLU split to run on"}
     )
     mmlu_dataset: Optional[str] = field(
-        default='mmlu-fs',
-        metadata={"help": "MMLU dataset to use: options are `mmlu-zs` for zero-shot or `mmlu-fs` for few shot."}
+        default="mmlu-fs",
+        metadata={
+            "help": "MMLU dataset to use: options are `mmlu-zs` for zero-shot or `mmlu-fs` for few shot."
+        },
     )
     do_mmlu_eval: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Whether to run the MMLU evaluation."}
+        default=False, metadata={"help": "Whether to run the MMLU evaluation."}
     )
     max_mmlu_samples: Optional[int] = field(
         default=None,
-        metadata={"help": "If set, only evaluates on `max_mmlu_samples` of the MMMLU dataset."}
+        metadata={
+            "help": "If set, only evaluates on `max_mmlu_samples` of the MMMLU dataset."
+        },
     )
     mmlu_source_max_len: int = field(
-        default=2048,
-        metadata={"help": "Maximum source sequence length for mmlu."}
+        default=2048, metadata={"help": "Maximum source sequence length for mmlu."}
     )
+    # TODO: XT - this is very costly because it won't use the LoRA technique for finetuning only adapters but instead finetune the whole model
     full_finetune: bool = field(
-        default=False,
-        metadata={"help": "Finetune the entire model without adapters."}
+        default=False, metadata={"help": "Finetune the entire model without adapters."}
     )
-    adam8bit: bool = field(
-        default=False,
-        metadata={"help": "Use 8-bit adam."}
-    )
+    adam8bit: bool = field(default=False, metadata={"help": "Use 8-bit adam."})
+    # TODO: XT - one of the proposed techniques in the QLoRA paper where the quantization constant is also quantized to save memory
     double_quant: bool = field(
         default=True,
-        metadata={"help": "Compress the quantization statistics through double quantization."}
+        metadata={
+            "help": "Compress the quantization statistics through double quantization."
+        },
     )
+    # TODO: XT - nf4 (NormalFloat4) is one of the proposed techniques in the QLoRA paper that uses normal distribution inspired quantization method to quantize a float to 4 bits
     quant_type: str = field(
         default="nf4",
-        metadata={"help": "Quantization data type to use. Should be one of `fp4` or `nf4`."}
+        metadata={
+            "help": "Quantization data type to use. Should be one of `fp4` or `nf4`."
+        },
     )
-    bits: int = field(
-        default=4,
-        metadata={"help": "How many bits to use."}
-    )
-    lora_r: int = field(
-        default=64,
-        metadata={"help": "Lora R dimension."}
-    )
-    lora_alpha: float = field(
-        default=16,
-        metadata={"help": " Lora alpha."}
-    )
-    lora_dropout: float = field(
-        default=0.0,
-        metadata={"help":"Lora dropout."}
-    )
-    max_memory_MB: int = field(
-        default=80000,
-        metadata={"help": "Free memory per gpu."}
-    )
+    # TODO: XT - I think this is used to determine how many bits to used to quantize a single float number
+    bits: int = field(default=4, metadata={"help": "How many bits to use."})
+    # TODO: XT - Lora attention dimension
+    lora_r: int = field(default=64, metadata={"help": "Lora R dimension."})
+    # TODO: XT - The alpha parameter for Lora scaling
+    lora_alpha: float = field(default=16, metadata={"help": " Lora alpha."})
+    # TODO: XT - The dropout probability for Lora layers. I remember QLoRA mentioned that dropout helps to mitigate overfitting issue
+    lora_dropout: float = field(default=0.0, metadata={"help": "Lora dropout."})
+    # TODO: XT - This seems to be used in loading LM model. Wonder whether we need to set it to the GPU memory size of what we have
+    max_memory_MB: int = field(default=80000, metadata={"help": "Free memory per gpu."})
     report_to: str = field(
-        default='none',
-        metadata={"help": "To use wandb or something else for reporting."}
+        default="none",
+        metadata={"help": "To use wandb or something else for reporting."},
     )
-    output_dir: str = field(default='./output', metadata={"help": 'The output dir for logs and checkpoints'})
-    optim: str = field(default='paged_adamw_32bit', metadata={"help": 'The optimizer to be used'})
-    per_device_train_batch_size: int = field(default=1, metadata={"help": 'The training batch size per GPU. Increase for better speed.'})
-    gradient_accumulation_steps: int = field(default=16, metadata={"help": 'How many gradients to accumulate before to perform an optimizer step'})
-    max_steps: int = field(default=10000, metadata={"help": 'How many optimizer update steps to take'})
-    weight_decay: float = field(default=0.0, metadata={"help": 'The L2 weight decay rate of AdamW'}) # use lora dropout instead for regularization if needed
-    learning_rate: float = field(default=0.0002, metadata={"help": 'The learnign rate'})
-    remove_unused_columns: bool = field(default=False, metadata={"help": 'Removed unused columns. Needed to make this codebase work.'})
-    max_grad_norm: float = field(default=0.3, metadata={"help": 'Gradient clipping max norm. This is tuned and works well for all models tested.'})
-    gradient_checkpointing: bool = field(default=True, metadata={"help": 'Use gradient checkpointing. You want to use this.'})
-    do_train: bool = field(default=True, metadata={"help": 'To train or not to train, that is the question?'})
-    lr_scheduler_type: str = field(default='constant', metadata={"help": 'Learning rate schedule. Constant a bit better than cosine, and has advantage for analysis'})
-    warmup_ratio: float = field(default=0.03, metadata={"help": 'Fraction of steps to do a warmup for'})
-    logging_steps: int = field(default=10, metadata={"help": 'The frequency of update steps after which to log the loss'})
-    group_by_length: bool = field(default=True, metadata={"help": 'Group sequences into batches with same length. Saves memory and speeds up training considerably.'})
-    save_strategy: str = field(default='steps', metadata={"help": 'When to save checkpoints'})
-    save_steps: int = field(default=250, metadata={"help": 'How often to save a model'})
-    save_total_limit: int = field(default=40, metadata={"help": 'How many checkpoints to save before the oldest is overwritten'})
+    # TODO: XT - we can set this to track experiments in different folders
+    output_dir: str = field(
+        default="./output", metadata={"help": "The output dir for logs and checkpoints"}
+    )
+    optim: str = field(
+        default="paged_adamw_32bit", metadata={"help": "The optimizer to be used"}
+    )
+    # TODO: XT - is this used anywhere?
+    per_device_train_batch_size: int = field(
+        default=1,
+        metadata={
+            "help": "The training batch size per GPU. Increase for better speed."
+        },
+    )
+    gradient_accumulation_steps: int = field(
+        default=16,
+        metadata={
+            "help": "How many gradients to accumulate before to perform an optimizer step"
+        },
+    )
+    max_steps: int = field(
+        default=10000, metadata={"help": "How many optimizer update steps to take"}
+    )
+    weight_decay: float = field(
+        default=0.0, metadata={"help": "The L2 weight decay rate of AdamW"}
+    )  # use lora dropout instead for regularization if needed
+    learning_rate: float = field(default=0.0002, metadata={"help": "The learnign rate"})
+    remove_unused_columns: bool = field(
+        default=False,
+        metadata={"help": "Removed unused columns. Needed to make this codebase work."},
+    )
+    max_grad_norm: float = field(
+        default=0.3,
+        metadata={
+            "help": "Gradient clipping max norm. This is tuned and works well for all models tested."
+        },
+    )
+    gradient_checkpointing: bool = field(
+        default=True,
+        metadata={"help": "Use gradient checkpointing. You want to use this."},
+    )
+    do_train: bool = field(
+        default=True,
+        metadata={"help": "To train or not to train, that is the question?"},
+    )
+    lr_scheduler_type: str = field(
+        default="constant",
+        metadata={
+            "help": "Learning rate schedule. Constant a bit better than cosine, and has advantage for analysis"
+        },
+    )
+    warmup_ratio: float = field(
+        default=0.03, metadata={"help": "Fraction of steps to do a warmup for"}
+    )
+    logging_steps: int = field(
+        default=10,
+        metadata={"help": "The frequency of update steps after which to log the loss"},
+    )
+    group_by_length: bool = field(
+        default=True,
+        metadata={
+            "help": "Group sequences into batches with same length. Saves memory and speeds up training considerably."
+        },
+    )
+    save_strategy: str = field(
+        default="steps", metadata={"help": "When to save checkpoints"}
+    )
+    save_steps: int = field(default=250, metadata={"help": "How often to save a model"})
+    save_total_limit: int = field(
+        default=40,
+        metadata={
+            "help": "How many checkpoints to save before the oldest is overwritten"
+        },
+    )
 
+
+# TODO: XT - are these arguments below used anywhere? A: yes, used directly as arguments to GenerationConfig
 @dataclass
 class GenerationArguments:
     # For more hyperparameters check:
@@ -184,12 +247,13 @@ class GenerationArguments:
     # Length arguments
     max_new_tokens: Optional[int] = field(
         default=256,
-        metadata={"help": "Maximum number of new tokens to be generated in evaluation or prediction loops"
-                          "if predict_with_generate is set."}
+        metadata={
+            "help": "Maximum number of new tokens to be generated in evaluation or prediction loops"
+            "if predict_with_generate is set."
+        },
     )
-    min_new_tokens : Optional[int] = field(
-        default=None,
-        metadata={"help": "Minimum number of new tokens to generate."}
+    min_new_tokens: Optional[int] = field(
+        default=None, metadata={"help": "Minimum number of new tokens to generate."}
     )
 
     # Generation strategy
@@ -197,39 +261,49 @@ class GenerationArguments:
     num_beams: Optional[int] = field(default=1)
     num_beam_groups: Optional[int] = field(default=1)
     penalty_alpha: Optional[float] = field(default=None)
-    use_cache: Optional[bool] = field(default=True) 
+    use_cache: Optional[bool] = field(default=True)
 
     # Hyperparameters for logit manipulation
     temperature: Optional[float] = field(default=1.0)
     top_k: Optional[int] = field(default=50)
     top_p: Optional[float] = field(default=1.0)
     typical_p: Optional[float] = field(default=1.0)
-    diversity_penalty: Optional[float] = field(default=0.0) 
-    repetition_penalty: Optional[float] = field(default=1.0) 
+    diversity_penalty: Optional[float] = field(default=0.0)
+    repetition_penalty: Optional[float] = field(default=1.0)
     length_penalty: Optional[float] = field(default=1.0)
-    no_repeat_ngram_size: Optional[int] = field(default=0) 
+    no_repeat_ngram_size: Optional[int] = field(default=0)
 
+
+# TODO: XT - it seems that this function tries to find all module names in the loaded LM model that would require a LoRA layer
 def find_all_linear_names(args, model):
-    cls = bnb.nn.Linear4bit if args.bits == 4 else (bnb.nn.Linear8bitLt if args.bits == 8 else torch.nn.Linear)
+    cls = (
+        bnb.nn.Linear4bit
+        if args.bits == 4
+        else (bnb.nn.Linear8bitLt if args.bits == 8 else torch.nn.Linear)
+    )
     lora_module_names = set()
     for name, module in model.named_modules():
         if isinstance(module, cls):
-            names = name.split('.')
+            names = name.split(".")
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
 
-
-    if 'lm_head' in lora_module_names: # needed for 16-bit
-        lora_module_names.remove('lm_head')
+    if "lm_head" in lora_module_names:  # needed for 16-bit
+        lora_module_names.remove("lm_head")
     return list(lora_module_names)
 
 
 class SavePeftModelCallback(transformers.TrainerCallback):
+    # TODO: XT - this is how PEFT model is saved
     def save_model(self, args, state, kwargs):
-        print('Saving PEFT checkpoint...')
+        print("Saving PEFT checkpoint...")
         if state.best_model_checkpoint is not None:
-            checkpoint_folder = os.path.join(state.best_model_checkpoint, "adapter_model")
+            checkpoint_folder = os.path.join(
+                state.best_model_checkpoint, "adapter_model"
+            )
         else:
-            checkpoint_folder = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
+            checkpoint_folder = os.path.join(
+                args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
+            )
 
         peft_model_path = os.path.join(checkpoint_folder, "adapter_model")
         kwargs["model"].save_pretrained(peft_model_path)
@@ -244,97 +318,122 @@ class SavePeftModelCallback(transformers.TrainerCallback):
 
     def on_train_end(self, args, state, control, **kwargs):
         def touch(fname, times=None):
-            with open(fname, 'a'):
+            with open(fname, "a"):
                 os.utime(fname, times)
 
-        touch(join(args.output_dir, 'completed'))
+        touch(join(args.output_dir, "completed"))
         self.save_model(args, state, kwargs)
 
-def get_accelerate_model(args, checkpoint_dir):
 
+def get_accelerate_model(args, checkpoint_dir):
     n_gpus = torch.cuda.device_count()
-    max_memory = f'{args.max_memory_MB}MB'
+    max_memory = f"{args.max_memory_MB}MB"
     max_memory = {i: max_memory for i in range(n_gpus)}
 
-    if args.full_finetune: assert args.bits in [16, 32]
+    if args.full_finetune:
+        assert args.bits in [16, 32]
 
-    print(f'loading base model {args.model_name_or_path}...')
-    compute_dtype = (torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
+    print(f"loading base model {args.model_name_or_path}...")
+    compute_dtype = (
+        torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)
+    )
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         load_in_4bit=args.bits == 4,
         load_in_8bit=args.bits == 8,
-        device_map='auto',
+        device_map="auto",
         max_memory=max_memory,
         quantization_config=BitsAndBytesConfig(
             load_in_4bit=args.bits == 4,
             load_in_8bit=args.bits == 8,
-            llm_int8_threshold=6.0,
+            llm_int8_threshold=6.0,  # TODO: XT - What does this threshold mean?
             llm_int8_has_fp16_weight=False,
             bnb_4bit_compute_dtype=compute_dtype,
             bnb_4bit_use_double_quant=args.double_quant,
-            bnb_4bit_quant_type=args.quant_type # {'fp4', 'nf4'}
+            bnb_4bit_quant_type=args.quant_type,  # {'fp4', 'nf4'}
         ),
-        torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
+        torch_dtype=(
+            torch.float32
+            if args.fp16
+            else (torch.bfloat16 if args.bf16 else torch.float32)
+        ),
         trust_remote_code=args.trust_remote_code,
     )
+    # TODO: XT - I don't see where bf16 is defined in the TrainingArguments?
     if compute_dtype == torch.float16 and args.bits == 4:
         major, minor = torch.cuda.get_device_capability()
         if major >= 8:
-            print('='*80)
-            print('Your GPU supports bfloat16, you can accelerate training with the argument --bf16')
-            print('='*80)
+            print("=" * 80)
+            print(
+                "Your GPU supports bfloat16, you can accelerate training with the argument --bf16"
+            )
+            print("=" * 80)
 
-    setattr(model, 'model_parallel', True)
-    setattr(model, 'is_parallelizable', True)
-    modules = find_all_linear_names(args, model)
+    setattr(model, "model_parallel", True)
+    setattr(model, "is_parallelizable", True)
+    target_modules = find_all_linear_names(args, model)
 
-    model.config.torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
+    model.config.torch_dtype = (
+        torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)
+    )
 
     if not args.full_finetune:
-        model = prepare_model_for_int8_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
+        # TODO: XT - not sure what is used in this function call
+        model = prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=args.gradient_checkpointing
+        )
     if args.gradient_checkpointing:
+        # TODO: XT - what model classes have this function?
         model.gradient_checkpointing_enable()
 
     config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
-        target_modules=modules,
+        target_modules=target_modules,
         lora_dropout=args.lora_dropout,
         bias="none",
-        task_type="CAUSAL_LM",
+        task_type="CAUSAL_LM",  # TODO: XT - what do all those task types defined in PEFT stand for?
     )
     if not args.full_finetune:
         if checkpoint_dir is not None:
             print("Loading adapters from checkpoint.")
-            model = PeftModel.from_pretrained(model, join(checkpoint_dir, 'adapter_model'))
+            # TODO: XT - this assumes adapter_model is the name of the folder where the adapter model is saved
+            model = PeftModel.from_pretrained(
+                model, join(checkpoint_dir, "adapter_model")
+            )
+            # TODO: XT - this seems to print out all lora module names
             for name, p in model.named_parameters():
-                if 'lora' in name:
+                if "lora" in name:
                     print(name, p.sum())
         else:
-            print(f'adding LoRA modules...')
+            print(f"adding LoRA modules...")
+            # TODO: XT - this will convert a base model to PEFT model with LoRA layers I think
             model = get_peft_model(model, config)
 
+    # TODO: XT - why do input layers need gradients?
     if args.gradient_checkpointing:
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
         else:
+
             def make_inputs_require_grad(module, input, output):
                 output.requires_grad_(True)
+
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-
+    # TODO: XT - seems like some hacky way to convert some model weights to bfloat16 type if bf16 is specified
     for name, module in model.named_modules():
         if isinstance(module, LoraLayer):
             if args.bf16:
                 module = module.to(torch.bfloat16)
-        if 'norm' in name:
+        if "norm" in name:
             module = module.to(torch.float32)
-        if 'lm_head' in name or 'embed_tokens' in name:
-            if hasattr(module, 'weight'):
+        if "lm_head" in name or "embed_tokens" in name:
+            if hasattr(module, "weight"):
                 if args.bf16 and module.weight.dtype == torch.float32:
                     module = module.to(torch.bfloat16)
     return model
+
 
 def print_trainable_parameters(args, model):
     """
@@ -346,8 +445,12 @@ def print_trainable_parameters(args, model):
         all_param += param.numel()
         if param.requires_grad:
             trainable_params += param.numel()
-    if args.bits == 4: trainable_params /= 2
-    print(f"trainable params: {trainable_params} || all params: {all_param} || trainable: {100 * trainable_params / all_param}")
+    if args.bits == 4:
+        trainable_params /= 2
+    print(
+        f"trainable params: {trainable_params} || all params: {all_param} || trainable: {100 * trainable_params / all_param}"
+    )
+
 
 def smart_tokenizer_and_embedding_resize(
     special_tokens_dict: Dict,
@@ -365,11 +468,16 @@ def smart_tokenizer_and_embedding_resize(
         input_embeddings = model.get_input_embeddings().weight.data
         output_embeddings = model.get_output_embeddings().weight.data
 
-        input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
-        output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+        input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(
+            dim=0, keepdim=True
+        )
+        output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(
+            dim=0, keepdim=True
+        )
 
         input_embeddings[-num_new_tokens:] = input_embeddings_avg
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
+
 
 @dataclass
 class DataCollatorForCausalLM(object):
@@ -381,14 +489,17 @@ class DataCollatorForCausalLM(object):
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         # Extract elements
-        sources = [example['input'] for example in instances]
-        targets = [f"{example['output']}{self.tokenizer.eos_token}" for example in instances]
+        sources = [sample["input"] for sample in instances]
+        targets = [
+            f"{sample['output']}{self.tokenizer.eos_token}" for sample in instances
+        ] # TODO: XT - it adds the eos token to the end of the target sequence, why?
         # Tokenize
         tokenized_sources_with_prompt = self.tokenizer(
             sources,
-            max_length=self.source_max_len,
+            max_length=self.source_max_len,  # TODO: XT - this parameter seems to be used to pad or truncate the source sequence
             truncation=True,
         )
+        # TODO: XT - what is target sequence used for?
         tokenized_targets = self.tokenizer(
             targets,
             max_length=self.target_max_len,
@@ -397,48 +508,63 @@ class DataCollatorForCausalLM(object):
         )
         # Build the input and labels for causal LM
         input_ids = []
-        labels = [] 
+        labels = []
         for tokenized_source, tokenized_target in zip(
-            tokenized_sources_with_prompt['input_ids'], 
-            tokenized_targets['input_ids']
+            tokenized_sources_with_prompt["input_ids"], tokenized_targets["input_ids"]
         ):
             if not self.predict_with_generate:
+                # TODO: XT - why does input_ids contain both tokenized_source and tokenized_target?
                 input_ids.append(torch.tensor(tokenized_source + tokenized_target))
+                # TODO: XT - what is the difference between these two behaviours related to whether train_on_source is True or False?
                 if not self.train_on_source:
                     labels.append(
-                        torch.tensor([IGNORE_INDEX for _ in range(len(tokenized_source))] + copy.deepcopy(tokenized_target))
+                        torch.tensor(
+                            [IGNORE_INDEX for _ in range(len(tokenized_source))]
+                            + copy.deepcopy(tokenized_target)
+                        )
                     )
                 else:
-                    labels.append(torch.tensor(copy.deepcopy(tokenized_source + tokenized_target)))
+                    # TODO: XT - my guess is this + operation below is used to concatenate the source and target sequences
+                    labels.append(
+                        torch.tensor(copy.deepcopy(tokenized_source + tokenized_target))
+                    )
             else:
                 input_ids.append(torch.tensor(tokenized_source))
         # Apply padding
-        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
-        labels = pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX) if not self.predict_with_generate else None
+        input_ids = pad_sequence(
+            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        )
+        labels = (
+            pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+            if not self.predict_with_generate
+            else None
+        )
         data_dict = {
-            'input_ids': input_ids,
-            'attention_mask':input_ids.ne(self.tokenizer.pad_token_id),
+            "input_ids": input_ids,
+            "attention_mask": input_ids.ne(self.tokenizer.pad_token_id),
         }
         if labels is not None:
-            data_dict['labels'] = labels
+            data_dict["labels"] = labels
         return data_dict
+
 
 def extract_unnatural_instructions_data(examples, extract_reformulations=False):
     out = {
-        'input': [],
-        'output': [],
+        "input": [],
+        "output": [],
     }
-    for example_instances in examples['instances']:
+    for example_instances in examples["instances"]:
         for instance in example_instances:
-            out['input'].append(instance['instruction_with_input'])
-            out['output'].append(instance['output'])
+            out["input"].append(instance["instruction_with_input"])
+            out["output"].append(instance["output"])
     if extract_reformulations:
-        for example_reformulations in examples['reformulations']:
+        for example_reformulations in examples["reformulations"]:
             if example_reformulations is not None:
                 for instance in example_reformulations:
-                    out['input'].append(instance['instruction_with_input'])
-                    out['output'].append(instance['output'])
+                    out["input"].append(instance["instruction_with_input"])
+                    out["output"].append(instance["output"])
     return out
+
 
 PROMPT_DICT = {
     "prompt_input": (
@@ -453,12 +579,14 @@ PROMPT_DICT = {
     ),
 }
 
+
 def extract_alpaca_dataset(example):
     if example.get("input", "") != "":
         prompt_format = PROMPT_DICT["prompt_input"]
     else:
         prompt_format = PROMPT_DICT["prompt_no_input"]
-    return {'input': prompt_format.format(**example)}
+    return {"input": prompt_format.format(**example)}
+
 
 def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
     """
@@ -467,7 +595,7 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
 
     Available datasets to be selected with `dataset` argument:
         - alpaca, 52002 examples
-        - alpaca cleaned, 51942 examples   
+        - alpaca cleaned, 51942 examples
         - chip2 (OIG), 210289 examples
         - self-instruct, 82612 examples
         - hh-rlhf (Anthropic), 160800 examples
@@ -488,114 +616,147 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
     """
     # Load dataset.
     # Alpaca
-    if args.dataset == 'alpaca':
+    if args.dataset == "alpaca":
         dataset = load_dataset("tatsu-lab/alpaca")
-        dataset = dataset.map(extract_alpaca_dataset, remove_columns=['instruction'])
+        dataset = dataset.map(extract_alpaca_dataset, remove_columns=["instruction"])
     # Alpaca clean
-    elif args.dataset == 'alpaca-clean':
+    elif args.dataset == "alpaca-clean":
         dataset = load_dataset("yahma/alpaca-cleaned")
-        dataset = dataset.map(extract_alpaca_dataset, remove_columns=['instruction'])
+        dataset = dataset.map(extract_alpaca_dataset, remove_columns=["instruction"])
     # Chip2
-    elif args.dataset == 'chip2':
-        dataset = load_dataset("laion/OIG", data_files='unified_chip2.jsonl')
-        dataset = dataset.map(lambda x: {
-            'input': x['text'].split('\n<bot>: ')[0].replace('<human>: ', ''),
-            'output': x['text'].split('\n<bot>: ')[1],
-        }, remove_columns=['text', 'metadata'])
+    elif args.dataset == "chip2":
+        dataset = load_dataset("laion/OIG", data_files="unified_chip2.jsonl")
+        dataset = dataset.map(
+            lambda x: {
+                "input": x["text"].split("\n<bot>: ")[0].replace("<human>: ", ""),
+                "output": x["text"].split("\n<bot>: ")[1],
+            },
+            remove_columns=["text", "metadata"],
+        )
     # Self Instruct
-    elif args.dataset == 'self-instruct':
-        dataset = load_dataset("yizhongw/self_instruct", name='self_instruct')
+    elif args.dataset == "self-instruct":
+        dataset = load_dataset("yizhongw/self_instruct", name="self_instruct")
         for old, new in [["prompt", "input"], ["completion", "output"]]:
             dataset = dataset.rename_column(old, new)
     # Anthropic rlhf
-    elif args.dataset == 'hh-rlhf':
+    elif args.dataset == "hh-rlhf":
         dataset = load_dataset("Anthropic/hh-rlhf")
-        dataset = dataset.map(lambda x: {
-            'input': '',
-            'output': x['chosen']
-        }, remove_columns=['chosen', 'rejected'])
+        dataset = dataset.map(
+            lambda x: {"input": "", "output": x["chosen"]},
+            remove_columns=["chosen", "rejected"],
+        )
     # LongForm
-    elif args.dataset == 'longform':
+    elif args.dataset == "longform":
         dataset = load_dataset("akoksal/LongForm")
-    elif args.dataset == 'vicuna':
+    elif args.dataset == "vicuna":
         raise NotImplementedError("Vicuna data was not released.")
     else:
         raise NotImplementedError(f"Dataset {args.dataset} not implemented yet.")
 
     # Split train/eval, reduce size
     if args.do_eval or args.do_predict:
-        if 'eval' in dataset:
-            eval_dataset = dataset['eval']
+        if "eval" in dataset:
+            eval_dataset = dataset["eval"]
         else:
-            print('Splitting train dataset in train and validation according to `eval_dataset_size`')
+            print(
+                "Splitting train dataset in train and validation according to `eval_dataset_size`"
+            )
             dataset = dataset["train"].train_test_split(
                 test_size=args.eval_dataset_size, shuffle=True, seed=42
             )
-            eval_dataset = dataset['test']
-        if args.max_eval_samples is not None and len(eval_dataset) > args.max_eval_samples:
+            eval_dataset = dataset["test"]
+        if (
+            args.max_eval_samples is not None
+            and len(eval_dataset) > args.max_eval_samples
+        ):
             eval_dataset = eval_dataset.select(range(args.max_eval_samples))
         if args.group_by_length:
-            eval_dataset = eval_dataset.map(lambda x: {'length': len(x['input']) + len(x['output'])})
+            eval_dataset = eval_dataset.map(
+                lambda x: {"length": len(x["input"]) + len(x["output"])}
+            )
     if args.do_train:
-        train_dataset = dataset['train']
-        if args.max_train_samples is not None and len(train_dataset) > args.max_train_samples:
+        train_dataset = dataset["train"]
+        if (
+            args.max_train_samples is not None
+            and len(train_dataset) > args.max_train_samples
+        ):
             train_dataset = train_dataset.select(range(args.max_train_samples))
         if args.group_by_length:
-            train_dataset = train_dataset.map(lambda x: {'length': len(x['input']) + len(x['output'])})
+            train_dataset = train_dataset.map(
+                lambda x: {"length": len(x["input"]) + len(x["output"])}
+            )
 
     data_collator = DataCollatorForCausalLM(
-        tokenizer=tokenizer, 
+        tokenizer=tokenizer,
         source_max_len=args.source_max_len,
         target_max_len=args.target_max_len,
         train_on_source=args.train_on_source,
         predict_with_generate=args.predict_with_generate,
     )
     return dict(
-        train_dataset=train_dataset if args.do_train else None, 
+        train_dataset=train_dataset if args.do_train else None,
         eval_dataset=eval_dataset if args.do_eval else None,
         predict_dataset=eval_dataset if args.do_predict else None,
-        data_collator=data_collator
+        data_collator=data_collator,
     )
+
 
 def get_last_checkpoint(checkpoint_dir):
     if isdir(checkpoint_dir):
-        is_completed = exists(join(checkpoint_dir, 'completed'))
-        if is_completed: return None, True # already finished
+        is_completed = exists(join(checkpoint_dir, "completed"))
+        if is_completed:
+            return None, True  # already finished
         max_step = 0
         for filename in os.listdir(checkpoint_dir):
-            if isdir(join(checkpoint_dir, filename)) and filename.startswith('checkpoint'):
-                max_step = max(max_step, int(filename.replace('checkpoint-', '')))
-        if max_step == 0: return None, is_completed # training started, but no checkpoint
-        checkpoint_dir = join(checkpoint_dir, f'checkpoint-{max_step}')
+            if isdir(join(checkpoint_dir, filename)) and filename.startswith(
+                "checkpoint"
+            ):
+                max_step = max(max_step, int(filename.replace("checkpoint-", "")))
+        if max_step == 0:
+            return None, is_completed  # training started, but no checkpoint
+        checkpoint_dir = join(checkpoint_dir, f"checkpoint-{max_step}")
         print(f"Found a previous checkpoint at: {checkpoint_dir}")
-        return checkpoint_dir, is_completed # checkpoint found!
-    return None, False # first training
+        return checkpoint_dir, is_completed  # checkpoint found!
+    return None, False  # first training
+
 
 def train():
-    hfparser = transformers.HfArgumentParser((
-        ModelArguments, DataArguments, TrainingArguments, GenerationArguments
-    ))
-    model_args, data_args, training_args, generation_args, extra_args = \
-        hfparser.parse_args_into_dataclasses(return_remaining_strings=True)
-    training_args.generation_config = transformers.GenerationConfig(**vars(generation_args))
+    hfparser = transformers.HfArgumentParser(
+        (ModelArguments, DataArguments, TrainingArguments, GenerationArguments)
+    )
+    (
+        model_args,
+        data_args,
+        training_args,
+        generation_args,
+        extra_args,
+    ) = hfparser.parse_args_into_dataclasses(return_remaining_strings=True)
+    training_args.generation_config = transformers.GenerationConfig(
+        **vars(generation_args)
+    )
     args = argparse.Namespace(
         **vars(model_args), **vars(data_args), **vars(training_args)
     )
-    
 
     checkpoint_dir, completed_training = get_last_checkpoint(args.output_dir)
     if completed_training:
-        print('Detected that training was already completed!')
+        print("Detected that training was already completed!")
 
+    # TODO: XT - this seems to convert a base model to PEFT model with LoRA layers and some other possible float type conversion, etc.
+    # TODO: XT - it loads checkpoint weights if there are any in a hard-coded relative path under "checkpoint_dir"
     model = get_accelerate_model(args, checkpoint_dir)
-    training_args.skip_loading_checkpoint_weights=True
-
+    # TODO: XT - why is this one set to True?
+    training_args.skip_loading_checkpoint_weights = True
+    # TODO: XT - set use_cache to False. What is this and why?
     model.config.use_cache = False
+    # TODO: XT - this prints out the number of trainable parameters and the percentage of it w.r.t. to the total amount of parameters
     print_trainable_parameters(args, model)
-    print('loaded model')
+    print("Loaded model")
+    # TODO: XT - do we have this argument? seems like we need to add it to the argument list of the script?
     set_seed(args.seed)
 
     # Tokenizer
+    # TODO: XT - from wikipedia (https://en.wikipedia.org/wiki/Large_language_model): In general, a LLM uses a separate tokenizer. A tokenizer maps between texts and lists of integers. The tokenizer is generally adapted to the entire training dataset first, then frozen, before the LLM is trained. A common choice is byte pair encoding.
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path,
         cache_dir=args.cache_dir,
@@ -608,43 +769,54 @@ def train():
             tokenizer=tokenizer,
             model=model,
         )
-    if any(key in args.model_name_or_path for key in ['llama', '7B', '13B', '30B', '65B']):
+
+    # TODO: XT - this is a werid way of determining which ones are LLaMA models
+    if any(
+        key in args.model_name_or_path for key in ["llama", "7B", "13B", "30B", "65B"]
+    ):
         # LLaMA tokenizer does not have special tokens set.
         # Add them to prevent them from being parsed into different tokens.
-        # Note that these are present in the vocabulary. 
+        # Note that these are present in the vocabulary.
         # Note also that `model.config.pad_token_id` is 0 which corresponds to `<unk>` token.
         tokenizer.add_special_tokens(
             {
                 "eos_token": tokenizer.convert_ids_to_tokens(model.config.eos_token_id),
                 "bos_token": tokenizer.convert_ids_to_tokens(model.config.bos_token_id),
-                "unk_token": tokenizer.convert_ids_to_tokens(model.config.pad_token_id), 
+                "unk_token": tokenizer.convert_ids_to_tokens(model.config.pad_token_id),
             }
         )
 
     data_module = make_data_module(tokenizer=tokenizer, args=args)
     trainer = Seq2SeqTrainer(
-        model=model, 
+        model=model,
         tokenizer=tokenizer,
         args=training_args,
-        **{k:v for k,v in data_module.items() if k != 'predict_dataset'},
+        **{k: v for k, v in data_module.items() if k != "predict_dataset"},
     )
 
     # Callbacks
     if not args.full_finetune:
         trainer.add_callback(SavePeftModelCallback)
+
     if args.do_mmlu_eval:
-        if args.mmlu_dataset == 'mmlu-zs':
-            mmlu_dataset = load_dataset("json", data_files={
-                'eval': 'data/mmlu/zero_shot_mmlu_val.json',
-                'test': 'data/mmlu/zero_shot_mmlu_test.json',
-            })
-            mmlu_dataset = mmlu_dataset.remove_columns('subject')
+        if args.mmlu_dataset == "mmlu-zs":
+            mmlu_dataset = load_dataset(
+                "json",
+                data_files={
+                    "eval": "data/mmlu/zero_shot_mmlu_val.json",
+                    "test": "data/mmlu/zero_shot_mmlu_test.json",
+                },
+            )
+            mmlu_dataset = mmlu_dataset.remove_columns("subject")
         # MMLU Five-shot (Eval/Test only)
-        elif args.mmlu_dataset == 'mmlu' or args.mmlu_dataset == 'mmlu-fs':
-            mmlu_dataset = load_dataset("json", data_files={
-                'eval': 'data/mmlu/five_shot_mmlu_val.json',
-                'test': 'data/mmlu/five_shot_mmlu_test.json',
-            })
+        elif args.mmlu_dataset == "mmlu" or args.mmlu_dataset == "mmlu-fs":
+            mmlu_dataset = load_dataset(
+                "json",
+                data_files={
+                    "eval": "data/mmlu/five_shot_mmlu_val.json",
+                    "test": "data/mmlu/five_shot_mmlu_test.json",
+                },
+            )
             # mmlu_dataset = mmlu_dataset.remove_columns('subject')
         mmlu_dataset = mmlu_dataset[args.mmlu_split]
         if args.max_mmlu_samples is not None:
@@ -666,48 +838,58 @@ def train():
                 preds, refs = [], []
                 loss_mmlu = 0
                 for batch in tqdm(data_loader, total=len(data_loader)):
-                    (loss, logits, labels) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False,)
+                    (loss, logits, labels) = trainer.prediction_step(
+                        trainer.model,
+                        batch,
+                        prediction_loss_only=False,
+                    )
                     # There are two tokens, the output, and eos token.
                     for i, logit in enumerate(logits):
-                        label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
-                        logit_abcd = logit[label_non_zero_id-1][abcd_idx]
+                        label_non_zero_id = (batch["labels"][i] != -100).nonzero()[0][0]
+                        logit_abcd = logit[label_non_zero_id - 1][abcd_idx]
                         preds.append(torch.argmax(logit_abcd).item())
-                    labels = labels[labels != IGNORE_INDEX].view(-1, 2)[:,0]
+                    labels = labels[labels != IGNORE_INDEX].view(-1, 2)[:, 0]
                     refs += [abcd_idx.index(label) for label in labels.tolist()]
-                    
+
                     loss_mmlu += loss.item()
                 # Extract results by subject.
-                results = {'mmlu_loss':loss_mmlu/len(data_loader)}
-                subject = mmlu_dataset['subject']
-                subjects = {s:{'refs':[], 'preds':[]} for s in set(subject)}
-                for s,p,r in zip(subject, preds, refs):
-                    subjects[s]['preds'].append(p)
-                    subjects[s]['refs'].append(r)
+                results = {"mmlu_loss": loss_mmlu / len(data_loader)}
+                subject = mmlu_dataset["subject"]
+                subjects = {s: {"refs": [], "preds": []} for s in set(subject)}
+                for s, p, r in zip(subject, preds, refs):
+                    subjects[s]["preds"].append(p)
+                    subjects[s]["refs"].append(r)
                 subject_scores = []
                 for subject in subjects:
                     subject_score = accuracy.compute(
-                        references=subjects[subject]['refs'],
-                        predictions=subjects[subject]['preds']
-                    )['accuracy']
-                    results[f'mmlu_{args.mmlu_split}_accuracy_{subject}'] = subject_score
+                        references=subjects[subject]["refs"],
+                        predictions=subjects[subject]["preds"],
+                    )["accuracy"]
+                    results[
+                        f"mmlu_{args.mmlu_split}_accuracy_{subject}"
+                    ] = subject_score
                     subject_scores.append(subject_score)
-                results[f'mmlu_{args.mmlu_split}_accuracy'] = np.mean(subject_scores)
+                results[f"mmlu_{args.mmlu_split}_accuracy"] = np.mean(subject_scores)
                 trainer.log(results)
                 trainer.data_collator.source_max_len = source_max_len
 
         trainer.add_callback(MMLUEvalCallback)
 
     # Verifying the datatypes.
+    # TODO: XT - This prints out the number of parameters in each datatype and the percentage of it w.r.t. to the total amount of parameters
     dtypes = {}
     for _, p in model.named_parameters():
         dtype = p.dtype
-        if dtype not in dtypes: dtypes[dtype] = 0
+        if dtype not in dtypes:
+            dtypes[dtype] = 0
         dtypes[dtype] += p.numel()
     total = 0
-    for k, v in dtypes.items(): total+= v
     for k, v in dtypes.items():
-        print(k, v, v/total)
+        total += v
+    for k, v in dtypes.items():
+        print(k, v, v / total)
 
+    # TODO: XT - convert model state dict to PEFT model state dict
     if args.bits < 16:
         old_state_dict = model.state_dict
         model.state_dict = (
@@ -717,6 +899,7 @@ def train():
     all_metrics = {"run_name": args.run_name}
     # Training
     if args.do_train:
+        logger.info("*** Train ***")
         train_result = trainer.train(resume_from_checkpoint=checkpoint_dir)
         metrics = train_result.metrics
         trainer.log_metrics("train", metrics)
@@ -733,26 +916,34 @@ def train():
     # Prediction
     if args.do_predict:
         logger.info("*** Predict ***")
-        prediction_output = trainer.predict(test_dataset=data_module['predict_dataset'],metric_key_prefix="predict")
+        prediction_output = trainer.predict(
+            test_dataset=data_module["predict_dataset"], metric_key_prefix="predict"
+        )
         prediction_metrics = prediction_output.metrics
         predictions = prediction_output.predictions
+        # TODO: XT - -100 should use IGNORE_INDEX instead?
         predictions = np.where(predictions != -100, predictions, tokenizer.pad_token_id)
+        # TODO: XT - this converts the token ids back to text
         predictions = tokenizer.batch_decode(
             predictions, skip_special_tokens=True, clean_up_tokenization_spaces=True
         )
-        with open(os.path.join(args.output_dir, 'predictions.jsonl'), 'w') as fout:
-            for i, example in enumerate(data_module['predict_dataset']):
-                example['prediction_with_input'] = predictions[i].strip()
-                example['prediction'] = predictions[i].replace(example['input'], '').strip()
-                fout.write(json.dumps(example) + '\n')
+        # TODO: XT - write out the predictions to a jsonl file
+        with open(os.path.join(args.output_dir, "predictions.jsonl"), "w") as fout:
+            for i, sample in enumerate(data_module["predict_dataset"]):
+                sample["prediction_with_input"] = predictions[i].strip()
+                sample["prediction"] = (
+                    predictions[i].replace(sample["input"], "").strip()
+                )
+                fout.write(json.dumps(sample) + "\n")
         print(prediction_metrics)
         trainer.log_metrics("predict", prediction_metrics)
         trainer.save_metrics("predict", prediction_metrics)
         all_metrics.update(prediction_metrics)
 
-    if (args.do_train or args.do_eval or args.do_predict):
+    if args.do_train or args.do_eval or args.do_predict:
         with open(os.path.join(args.output_dir, "metrics.json"), "w") as fout:
             fout.write(json.dumps(all_metrics))
+
 
 if __name__ == "__main__":
     train()
