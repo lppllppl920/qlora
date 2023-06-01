@@ -11,6 +11,7 @@ import numpy as np
 from tqdm import tqdm
 import logging
 import bitsandbytes as bnb
+import pandas as pd
 
 import torch
 import transformers
@@ -22,18 +23,17 @@ from transformers import (
     set_seed,
     Seq2SeqTrainer,
     BitsAndBytesConfig,
-)
-from datasets import load_dataset
-import evaluate
+    LlamaTokenizer
 
-# import nltk
+)
+from datasets import load_dataset, Dataset
+import evaluate
 
 from peft import (
     prepare_model_for_kbit_training,
     LoraConfig,
     get_peft_model,
-    get_peft_model_state_dict,
-    PeftModel,
+    PeftModel
 )
 from peft.tuners.lora import LoraLayer
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
@@ -95,6 +95,10 @@ class DataArguments:
     dataset: str = field(
         default="alpaca",
         metadata={"help": "Which dataset to finetune on. See datamodule for options."},
+    )
+    dataset_format: Optional[str] = field(
+        default=None,
+        metadata={"help": "Which dataset format is used. [alpaca|chip2|self-instruct|hh-rlhf]"}
     )
 
 
@@ -339,6 +343,7 @@ def get_accelerate_model(args, checkpoint_dir):
     )
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
+        cache_dir=args.cache_dir,
         load_in_4bit=args.bits == 4,
         load_in_8bit=args.bits == 8,
         device_map="auto",
@@ -350,12 +355,7 @@ def get_accelerate_model(args, checkpoint_dir):
             llm_int8_has_fp16_weight=False,
             bnb_4bit_compute_dtype=compute_dtype,
             bnb_4bit_use_double_quant=args.double_quant,
-            bnb_4bit_quant_type=args.quant_type,  # {'fp4', 'nf4'}
-        ),
-        torch_dtype=(
-            torch.float32
-            if args.fp16
-            else (torch.bfloat16 if args.bf16 else torch.float32)
+            bnb_4bit_quant_type=args.quant_type
         ),
         trust_remote_code=args.trust_remote_code,
     )
@@ -369,59 +369,36 @@ def get_accelerate_model(args, checkpoint_dir):
             )
             print("=" * 80)
 
-    setattr(model, "model_parallel", True)
-    setattr(model, "is_parallelizable", True)
-    target_modules = find_all_linear_names(args, model)
+    setattr(model, 'model_parallel', True)
+    setattr(model, 'is_parallelizable', True)
 
     model.config.torch_dtype = (
         torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)
     )
 
     if not args.full_finetune:
-        # TODO: XT - not sure what is used in this function call
-        model = prepare_model_for_kbit_training(
-            model, use_gradient_checkpointing=args.gradient_checkpointing
-        )
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
     if args.gradient_checkpointing:
         # TODO: XT - what model classes have this function?
         model.gradient_checkpointing_enable()
 
-    config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=target_modules,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",  # TODO: XT - what do all those task types defined in PEFT stand for?
-    )
     if not args.full_finetune:
         if checkpoint_dir is not None:
             print("Loading adapters from checkpoint.")
-            # TODO: XT - this assumes adapter_model is the name of the folder where the adapter model is saved
-            model = PeftModel.from_pretrained(
-                model, join(checkpoint_dir, "adapter_model")
-            )
-            # TODO: XT - this seems to print out all lora module names
-            for name, p in model.named_parameters():
-                if "lora" in name:
-                    print(name, p.sum())
+            model = PeftModel.from_pretrained(model, join(checkpoint_dir, 'adapter_model'), is_trainable=True)
         else:
-            print(f"adding LoRA modules...")
-            # TODO: XT - this will convert a base model to PEFT model with LoRA layers I think
+            print(f'adding LoRA modules...')
+            modules = find_all_linear_names(args, model)
+            config = LoraConfig(
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                target_modules=modules,
+                lora_dropout=args.lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
             model = get_peft_model(model, config)
 
-    # TODO: XT - why do input layers need gradients?
-    if args.gradient_checkpointing:
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
-        else:
-
-            def make_inputs_require_grad(module, input, output):
-                output.requires_grad_(True)
-
-            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-
-    # TODO: XT - seems like some hacky way to convert some model weights to bfloat16 type if bf16 is specified
     for name, module in model.named_modules():
         if isinstance(module, LoraLayer):
             if args.bf16:
@@ -445,12 +422,12 @@ def print_trainable_parameters(args, model):
         all_param += param.numel()
         if param.requires_grad:
             trainable_params += param.numel()
-    if args.bits == 4:
-        trainable_params /= 2
+    if args.bits == 4: trainable_params /= 2
     print(
-        f"trainable params: {trainable_params} || all params: {all_param} || trainable: {100 * trainable_params / all_param}"
+        f"trainable params: {trainable_params} || "
+        f"all params: {all_param} || "
+        f"trainable: {100 * trainable_params / all_param}"
     )
-
 
 def smart_tokenizer_and_embedding_resize(
     special_tokens_dict: Dict,
@@ -489,15 +466,14 @@ class DataCollatorForCausalLM(object):
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         # Extract elements
-        sources = [sample["input"] for sample in instances]
-        targets = [
-            f"{sample['output']}{self.tokenizer.eos_token}" for sample in instances
-        ] # TODO: XT - it adds the eos token to the end of the target sequence, why?
+        sources = [f"{self.tokenizer.bos_token}{example['input']}" for example in instances]
+        targets = [f"{example['output']}{self.tokenizer.eos_token}" for example in instances] # TODO: XT - it adds the eos token to the end of the target sequence, why?
         # Tokenize
         tokenized_sources_with_prompt = self.tokenizer(
             sources,
             max_length=self.source_max_len,  # TODO: XT - this parameter seems to be used to pad or truncate the source sequence
             truncation=True,
+            add_special_tokens=False,
         )
         # TODO: XT - what is target sequence used for?
         tokenized_targets = self.tokenizer(
@@ -565,8 +541,7 @@ def extract_unnatural_instructions_data(examples, extract_reformulations=False):
                     out["output"].append(instance["output"])
     return out
 
-
-PROMPT_DICT = {
+ALPACA_PROMPT_DICT = {
     "prompt_input": (
         "Below is an instruction that describes a task, paired with an input that provides further context. "
         "Write a response that appropriately completes the request.\n\n"
@@ -582,11 +557,25 @@ PROMPT_DICT = {
 
 def extract_alpaca_dataset(example):
     if example.get("input", "") != "":
-        prompt_format = PROMPT_DICT["prompt_input"]
+        prompt_format = ALPACA_PROMPT_DICT["prompt_input"]
     else:
-        prompt_format = PROMPT_DICT["prompt_no_input"]
-    return {"input": prompt_format.format(**example)}
+        prompt_format = ALPACA_PROMPT_DICT["prompt_no_input"]
+    return {'input': prompt_format.format(**example)}
 
+def local_dataset(dataset_name):
+    if dataset_name.endswith('.json'):
+        full_dataset = Dataset.from_json(path_or_paths=dataset_name)
+    elif dataset_name.endswith('.jsonl'):
+        full_dataset = Dataset.from_json(filename=dataset_name, format='jsonlines')
+    elif dataset_name.endswith('.csv'):
+        full_dataset = Dataset.from_pandas(pd.read_csv(dataset_name))
+    elif dataset_name.endswith('.tsv'):
+        full_dataset = Dataset.from_pandas(pd.read_csv(dataset_name, delimiter='\t'))
+    else:
+        raise ValueError(f"Unsupported dataset format: {dataset_name}")
+
+    split_dataset = full_dataset.train_test_split(test_size=0.1)
+    return split_dataset
 
 def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
     """
@@ -600,58 +589,79 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
         - self-instruct, 82612 examples
         - hh-rlhf (Anthropic), 160800 examples
         - longform, 23.7k examples
+        - oasst1 (OpenAssistant) primary message tree only, 9,846 examples
 
     Coming soon:
         - unnatural instructions core, 66010 examples
         - unnatural instructions full, 240670 examples
         - alpaca-gpt4, 52002 examples
         - unnatural-instructions-gpt4, 9000 examples
-        - oa-rlhf (OpenAssistant) primary message tree only, 9209 examples
-        - oa-rlhf-assistant (OpenAssistant) all assistant  replies with ranking
         - supernatural-instructions, 69624 examples (same as paper with 100 ex/task more can be used)
         - flan (FLAN v2), up to 20M examples available
+        - vicuna
 
-    Not Available:
-        - vicuna, not released at the moment.
     """
-    # Load dataset.
-    # Alpaca
-    if args.dataset == "alpaca":
-        dataset = load_dataset("tatsu-lab/alpaca")
-        dataset = dataset.map(extract_alpaca_dataset, remove_columns=["instruction"])
-    # Alpaca clean
-    elif args.dataset == "alpaca-clean":
-        dataset = load_dataset("yahma/alpaca-cleaned")
-        dataset = dataset.map(extract_alpaca_dataset, remove_columns=["instruction"])
-    # Chip2
-    elif args.dataset == "chip2":
-        dataset = load_dataset("laion/OIG", data_files="unified_chip2.jsonl")
-        dataset = dataset.map(
-            lambda x: {
-                "input": x["text"].split("\n<bot>: ")[0].replace("<human>: ", ""),
-                "output": x["text"].split("\n<bot>: ")[1],
-            },
-            remove_columns=["text", "metadata"],
+    def load_data(dataset_name):
+        if dataset_name == 'alpaca':
+            return load_dataset("tatsu-lab/alpaca")
+        elif dataset_name == 'alpaca-clean':
+            return load_dataset("yahma/alpaca-cleaned")
+        elif dataset_name == 'chip2':
+            return load_dataset("laion/OIG", data_files='unified_chip2.jsonl')
+        elif dataset_name == 'self-instruct':
+            return load_dataset("yizhongw/self_instruct", name='self_instruct')
+        elif dataset_name == 'hh-rlhf':
+            return load_dataset("Anthropic/hh-rlhf")
+        elif dataset_name == 'longform':
+            return load_dataset("akoksal/LongForm")
+        elif dataset_name == 'oasst1':
+            return load_dataset("timdettmers/openassistant-guanaco")
+        elif dataset_name == 'vicuna':
+            raise NotImplementedError("Vicuna data was not released.")
+        else:
+            if os.path.exists(dataset_name):
+                try:
+                    args.dataset_format = args.dataset_format if args.dataset_format else "alpaca"
+                    full_dataset = local_dataset(dataset_name)
+                    return full_dataset
+                except:
+                    raise ValueError(f"Error loading dataset from {dataset_name}")
+            else:
+                raise NotImplementedError(f"Dataset {dataset_name} not implemented yet.")
+
+    def format_dataset(dataset, dataset_format):
+        if (
+            dataset_format == 'alpaca' or dataset_format == 'alpaca-clean' or
+            (dataset_format is None and args.dataset in ['alpaca', 'alpaca-clean'])
+        ):
+            dataset = dataset.map(extract_alpaca_dataset, remove_columns=['instruction'])
+        elif dataset_format == 'chip2' or (dataset_format is None and args.dataset == 'chip2'):
+            dataset = dataset.map(lambda x: {
+                'input': x['text'].split('\n<bot>: ')[0].replace('<human>: ', ''),
+                'output': x['text'].split('\n<bot>: ')[1],
+            })
+        elif dataset_format == 'self-instruct' or (dataset_format is None and args.dataset == 'self-instruct'):
+            for old, new in [["prompt", "input"], ["completion", "output"]]:
+                dataset = dataset.rename_column(old, new)
+        elif dataset_format == 'hh-rlhf' or (dataset_format is None and args.dataset == 'hh-rlhf'):
+            dataset = dataset.map(lambda x: {
+                'input': '',
+                'output': x['chosen']
+            })
+        elif dataset_format == 'oasst1' or (dataset_format is None and args.dataset == 'oasst1'):
+            dataset = dataset.map(lambda x: {
+                'input': '',
+                'output': x['text'],
+            })
+        # Remove unused columns.
+        dataset = dataset.remove_columns(
+            [col for col in dataset.column_names['train'] if col not in ['input', 'output']]
         )
-    # Self Instruct
-    elif args.dataset == "self-instruct":
-        dataset = load_dataset("yizhongw/self_instruct", name="self_instruct")
-        for old, new in [["prompt", "input"], ["completion", "output"]]:
-            dataset = dataset.rename_column(old, new)
-    # Anthropic rlhf
-    elif args.dataset == "hh-rlhf":
-        dataset = load_dataset("Anthropic/hh-rlhf")
-        dataset = dataset.map(
-            lambda x: {"input": "", "output": x["chosen"]},
-            remove_columns=["chosen", "rejected"],
-        )
-    # LongForm
-    elif args.dataset == "longform":
-        dataset = load_dataset("akoksal/LongForm")
-    elif args.dataset == "vicuna":
-        raise NotImplementedError("Vicuna data was not released.")
-    else:
-        raise NotImplementedError(f"Dataset {args.dataset} not implemented yet.")
+        return dataset
+
+     # Load dataset.
+    dataset = load_data(args.dataset)
+    dataset = format_dataset(dataset, args.dataset_format)
 
     # Split train/eval, reduce size
     if args.do_eval or args.do_predict:
@@ -745,9 +755,6 @@ def train():
     # TODO: XT - this seems to convert a base model to PEFT model with LoRA layers and some other possible float type conversion, etc.
     # TODO: XT - it loads checkpoint weights if there are any in a hard-coded relative path under "checkpoint_dir"
     model = get_accelerate_model(args, checkpoint_dir)
-    # TODO: XT - why is this one set to True?
-    training_args.skip_loading_checkpoint_weights = True
-    # TODO: XT - set use_cache to False. What is this and why?
     model.config.use_cache = False
     # TODO: XT - this prints out the number of trainable parameters and the percentage of it w.r.t. to the total amount of parameters
     print_trainable_parameters(args, model)
@@ -761,31 +768,28 @@ def train():
         args.model_name_or_path,
         cache_dir=args.cache_dir,
         padding_side="right",
-        use_fast=True,
+        use_fast=False, # Fast tokenizer giving issues.
+        tokenizer_type='llama' if 'llama' in args.model_name_or_path else None, # Needed for HF name change
     )
-    if tokenizer.pad_token is None:
+    if tokenizer._pad_token is None:
         smart_tokenizer_and_embedding_resize(
             special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
             tokenizer=tokenizer,
             model=model,
         )
-
-    # TODO: XT - this is a werid way of determining which ones are LLaMA models
-    if any(
-        key in args.model_name_or_path for key in ["llama", "7B", "13B", "30B", "65B"]
-    ):
-        # LLaMA tokenizer does not have special tokens set.
-        # Add them to prevent them from being parsed into different tokens.
+    if 'llama' in args.model_name_or_path or isinstance(tokenizer, LlamaTokenizer):
+        # LLaMA tokenizer may not have correct special tokens set.
+        # Check and add them if missing to prevent them from being parsed into different tokens.
         # Note that these are present in the vocabulary.
         # Note also that `model.config.pad_token_id` is 0 which corresponds to `<unk>` token.
-        tokenizer.add_special_tokens(
-            {
+        print('Adding special tokens.')
+        tokenizer.add_special_tokens({
                 "eos_token": tokenizer.convert_ids_to_tokens(model.config.eos_token_id),
                 "bos_token": tokenizer.convert_ids_to_tokens(model.config.bos_token_id),
-                "unk_token": tokenizer.convert_ids_to_tokens(model.config.pad_token_id),
-            }
-        )
-
+                "unk_token": tokenizer.convert_ids_to_tokens(
+                    model.config.pad_token_id if model.config.pad_token_id != -1 else tokenizer.pad_token_id
+                ),
+        })
     data_module = make_data_module(tokenizer=tokenizer, args=args)
     trainer = Seq2SeqTrainer(
         model=model,
@@ -828,7 +832,6 @@ def train():
             tokenizer("D", add_special_tokens=False).input_ids[0],
         ]
         accuracy = evaluate.load("accuracy")
-
         class MMLUEvalCallback(transformers.TrainerCallback):
             def on_evaluate(self, args, state, control, model, **kwargs):
                 data_loader = trainer.get_eval_dataloader(mmlu_dataset)
@@ -850,7 +853,6 @@ def train():
                         preds.append(torch.argmax(logit_abcd).item())
                     labels = labels[labels != IGNORE_INDEX].view(-1, 2)[:, 0]
                     refs += [abcd_idx.index(label) for label in labels.tolist()]
-
                     loss_mmlu += loss.item()
                 # Extract results by subject.
                 results = {"mmlu_loss": loss_mmlu / len(data_loader)}
@@ -889,18 +891,13 @@ def train():
     for k, v in dtypes.items():
         print(k, v, v / total)
 
-    # TODO: XT - convert model state dict to PEFT model state dict
-    if args.bits < 16:
-        old_state_dict = model.state_dict
-        model.state_dict = (
-            lambda self, *_, **__: get_peft_model_state_dict(self, old_state_dict())
-        ).__get__(model, type(model))
-
     all_metrics = {"run_name": args.run_name}
     # Training
     if args.do_train:
         logger.info("*** Train ***")
-        train_result = trainer.train(resume_from_checkpoint=checkpoint_dir)
+        # Note: `resume_from_checkpoint` not supported for adapter checkpoints by HF.
+        # Currently adapter checkpoint is reloaded as expected but optimizer/scheduler states are not.
+        train_result = trainer.train()
         metrics = train_result.metrics
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
